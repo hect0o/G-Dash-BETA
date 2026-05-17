@@ -2,7 +2,7 @@
 
 A modern, minimal, tablet-style dashboard built for GeoFS.
 
-G-Dash brings extra flight data, tracking tools, and a cleaner cockpit experience to your flights.
+G-Dash brings extra flight data, tracking tools, all in a clean ui.
 
 > ⚠️ This project is currently in beta, so you may run into bugs or unfinished features.
 
