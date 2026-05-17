@@ -20,20 +20,14 @@ G-Dash brings extra flight data, tracking tools, and a cleaner cockpit experienc
 
 ## 📥 Installation
 
-### 1. Install Tampermonkey
-Install :contentReference[oaicite:1]{index=1} in your browser.
+### 1. Install [Tampermonkey](https://www.tampermonkey.net/)
+Click the link above and install Tampermonkey for your browser.
 
 ### 2. Install G-Dash
 Click below:
 
-## **[🚀 Install G-Dash](https://raw.githubusercontent.com/hect0o/G-Dash-BETA/main/G-Dash.user.js)**
+## **[Install G-Dash](https://raw.githubusercontent.com/hect0o/G-Dash-BETA/main/G-Dash.user.js)**
 
 ---
 
-## 📸 Preview
-
-Coming soon...
-
----
-
-Built by Hecto ✨
+Built by **[Hecto](https://guns.lol/hect.oo)**
