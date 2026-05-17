@@ -3,7 +3,7 @@
 // @namespace    https://github.com/hect0o
 // @version      1
 // @description  Tablet-style dashboard for GeoFS — live map, flight logbook, multi-pilot support
-// @author       @hecto.oooo
+// @author       hecto.oooo
 // @match        https://www.geo-fs.com/geofs.php*
 // @match        https://geo-fs.com/geofs.php*
 // @grant        none
@@ -13,15 +13,9 @@
 (function () {
   'use strict';
 
-  // ════════════════════════════════════════════════════════════════════════════
-  //  ✏️  CUSTOMIZATION
-  // ════════════════════════════════════════════════════════════════════════════
 
   const DASHBOARD_NAME = 'G-Dash';
 
-  // MAP TILE URL — swap this to change maps (see comments below)
-  // Mapbox:       'https://api.mapbox.com/styles/v1/mapbox/dark-v11/tiles/{z}/{x}/{y}?access_token=YOUR_TOKEN'
-  // Thunderforest: 'https://tile.thunderforest.com/pioneer/{z}/{x}/{y}.png?apikey=YOUR_KEY'
   const MAP_TILE_URL         = 'https://tile.openstreetmap.org/{z}/{x}/{y}.png';
   const MAP_TILE_ATTRIBUTION = '© OpenStreetMap contributors';
 
