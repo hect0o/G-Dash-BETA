@@ -2,7 +2,7 @@
 
 A Modern, minimal tablet like looking interface for Geo-Fs. This project is in beta now, so watch out for some bugs😭
 
-##Features
+## Features
 *Live Map with all txy etc
 *Logbook
 *Accurate Flight timetracker
@@ -18,9 +18,6 @@ Install Tampermonkey in your browser.
 Click below to install G-Dash:
 
 [Install G-Dash](https://github.com/hect0o/G-Dash-BETA/raw/refs/heads/main/G-Dash.user.js)
-
-## Updating
-G-Dash updates automatically through Tampermonkey when new versions are released.
 
 ---
 Made by Hecto
