@@ -10,6 +10,7 @@
 // @downloadURL  https://raw.githubusercontent.com/hect0o/G-Dash-BETA/refs/heads/main/G-Dash.js
 // @updateURL    https://raw.githubusercontent.com/hect0o/G-Dash-BETA/refs/heads/main/G-Dash.js
 // @run-at       document-idle
+
 // ==/UserScript==
 
 (function () {
