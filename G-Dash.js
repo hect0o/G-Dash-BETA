@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         G-Dash
 // @namespace    https://github.com/hect0o
-// @version      1
+// @version      1.0.0
 // @description  Tablet-style dashboard for GeoFS — live map, flight logbook, multi-pilot support
 // @author       hecto.oooo
 // @match        https://www.geo-fs.com/geofs.php*
