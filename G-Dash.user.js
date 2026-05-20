@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         G-Dash
 // @namespace    https://github.com/hect0o
-// @version      1.0.1
+// @version      1.0.2
 // @description  Tablet-style dashboard for GeoFS — live map, flight logbook, multi-pilot support
 // @author       hecto.oooo
 // @match        https://www.geo-fs.com/geofs.php*
@@ -79,10 +79,13 @@
     localStorage.setItem(SETTINGS_KEY, JSON.stringify(s));
   }
   let settings = loadSettings();
-  if (!settings.keybind)    settings.keybind    = '`';
-  if (!settings.fullscreen) settings.fullscreen = false;
-  if (!settings.btnX)       settings.btnX       = null;
-  if (!settings.btnY)       settings.btnY       = null;
+  if (!settings.keybind)       settings.keybind       = '`';
+  if (!settings.fullscreen)    settings.fullscreen    = false;
+  if (!settings.btnX)          settings.btnX          = null;
+  if (!settings.btnY)          settings.btnY          = null;
+  if (!settings.quarterScreen) settings.quarterScreen = false;
+  if (settings.compactX === undefined) settings.compactX = null;
+  if (settings.compactY === undefined) settings.compactY = null;
 
   // ════════════════════════════════════════════════════════════════════════════
   //  STATE
@@ -129,7 +132,9 @@
       const coords = ac.llaLocation;
       if (!coords || coords[0] == null) return null;
 
-      const headingDeg = ac.animationValue?.heading ?? 0;
+      const headingRaw = ac.animationValue?.heading ?? 0;
+      // ✅ FIX: normalise to 0–360 so negatives like -108 display as 252
+      const headingDeg = ((headingRaw % 360) + 360) % 360;
 
       const speedKts = ac.animationValue?.kias != null
         ? ac.animationValue.kias
@@ -196,6 +201,13 @@
         position:fixed; inset:0; z-index:99998;
         display:flex; align-items:center; justify-content:center;
         background:rgba(0,5,14,0.80); backdrop-filter:blur(8px);
+        transition:background .3s ease, backdrop-filter .3s ease;
+      }
+      /* Compact mode — overlay becomes fully transparent & click-through */
+      #gfs-overlay.compact-mode {
+        background:transparent !important;
+        backdrop-filter:none !important;
+        pointer-events:none;
       }
 
       #gfs-tablet {
@@ -208,6 +220,24 @@
         display:flex; flex-direction:column; overflow:hidden;
         font-family:'Inter',sans-serif;
         animation:gfs-pop .32s cubic-bezier(.22,1,.36,1);
+        transition:width .3s ease, height .3s ease, max-width .3s ease, max-height .3s ease;
+      }
+      /* ✅ Quarter-screen compact mode — floats freely over game */
+      #gfs-tablet.quarter-screen {
+        position:fixed !important;
+        width:50vw !important;
+        max-width:50vw !important;
+        min-width:0 !important;
+        height:50vh !important;
+        max-height:50vh !important;
+        min-height:0 !important;
+        pointer-events:auto;
+        cursor:default;
+        z-index:99999;
+      }
+      #gfs-tablet.quarter-screen.tablet-dragging {
+        cursor:grabbing !important;
+        opacity:.92;
       }
       @keyframes gfs-pop {
         from{transform:translateY(38px) scale(.96);opacity:0}
@@ -553,6 +583,26 @@
       }
       #btn-pos-reset:hover{border-color:${A};color:${A};}
 
+      /* ── SIZE TOGGLE ── */
+      #size-toggle {
+        width:52px; height:28px; border-radius:14px;
+        background:#0a1928; border:1.5px solid #1e3d58;
+        cursor:pointer; position:relative;
+        transition:background .25s, border-color .25s;
+        flex-shrink:0;
+      }
+      #size-toggle-knob {
+        position:absolute; top:4px; left:4px;
+        width:18px; height:18px; border-radius:50%;
+        background:#4a7a9a;
+        transition:transform .25s, background .25s;
+      }
+      #size-mode-label {
+        font-family:'Orbitron',monospace; font-size:10px;
+        font-weight:700; color:#7fb3cc; letter-spacing:1.5px;
+        min-width:68px;
+      }
+
       /* ── FOOTER ── */
       #gfs-footer{
         display:flex;align-items:center;justify-content:space-between;
@@ -777,6 +827,18 @@
                 <div class="setting-label">Draggable Toggle Button</div>
                 <div class="setting-desc">The floating ✈ button can be dragged anywhere on screen. Its position is saved automatically. Click below to reset it to the default position.</div>
                 <button id="btn-pos-reset">Reset to Default Position</button>
+              </div>
+
+              <div class="sec">◈ Dashboard Size</div>
+              <div class="setting-row">
+                <div class="setting-label">Size Mode</div>
+                <div class="setting-desc">Toggle between the normal tablet size and a compact quarter-screen view that stays out of the way while you fly.</div>
+                <div style="display:flex;align-items:center;gap:14px;margin-top:4px;">
+                  <span id="size-mode-label">NORMAL</span>
+                  <div id="size-toggle">
+                    <div id="size-toggle-knob"></div>
+                  </div>
+                </div>
               </div>
 
             </div>
@@ -1098,6 +1160,114 @@
   }
 
   // ════════════════════════════════════════════════════════════════════════════
+  //  SIZE TOGGLE  +  COMPACT DRAG
+  // ════════════════════════════════════════════════════════════════════════════
+  function initSizeToggle() {
+    const toggle = document.getElementById('size-toggle');
+    const knob   = document.getElementById('size-toggle-knob');
+    const label  = document.getElementById('size-mode-label');
+    const tablet = document.getElementById('gfs-tablet');
+    const ov     = document.getElementById('gfs-overlay');
+    if (!toggle) return;
+
+    // ── draggable tablet (compact mode only) ────────────────────────────────
+    let tDragged = false, tStartX, tStartY, tStartL, tStartT;
+
+    function onTabletMouseMove(e) {
+      const dx = e.clientX - tStartX;
+      const dy = e.clientY - tStartY;
+      if (Math.abs(dx) > 4 || Math.abs(dy) > 4) tDragged = true;
+      if (!tDragged) return;
+      let nl = tStartL + dx;
+      let nt = tStartT + dy;
+      nl = Math.max(0, Math.min(window.innerWidth  - tablet.offsetWidth,  nl));
+      nt = Math.max(0, Math.min(window.innerHeight - tablet.offsetHeight, nt));
+      tablet.style.left = nl + 'px';
+      tablet.style.top  = nt + 'px';
+    }
+
+    function onTabletMouseUp() {
+      tablet.classList.remove('tablet-dragging');
+      document.removeEventListener('mousemove', onTabletMouseMove);
+      document.removeEventListener('mouseup',   onTabletMouseUp);
+      if (tDragged) {
+        const r = tablet.getBoundingClientRect();
+        settings.compactX = r.left;
+        settings.compactY = r.top;
+        saveSettings(settings);
+      }
+    }
+
+    function attachTabletDrag() {
+      tablet.addEventListener('mousedown', onTabletDragStart);
+    }
+    function detachTabletDrag() {
+      tablet.removeEventListener('mousedown', onTabletDragStart);
+    }
+
+    function onTabletDragStart(e) {
+      // Only drag from the topbar, not buttons/inputs inside
+      const tag = e.target.tagName;
+      if (tag === 'BUTTON' || tag === 'INPUT' || tag === 'SELECT') return;
+      if (e.button !== 0) return;
+      tDragged = false;
+      tStartX  = e.clientX;
+      tStartY  = e.clientY;
+      const r  = tablet.getBoundingClientRect();
+      tStartL  = r.left;
+      tStartT  = r.top;
+      tablet.classList.add('tablet-dragging');
+      document.addEventListener('mousemove', onTabletMouseMove);
+      document.addEventListener('mouseup',   onTabletMouseUp);
+    }
+
+    // ── apply size state ─────────────────────────────────────────────────────
+    function applySize(quarter) {
+      settings.quarterScreen = quarter;
+      saveSettings(settings);
+
+      if (quarter) {
+        // Position tablet before adding class so it lands somewhere sensible
+        const cx = settings.compactX ?? Math.round(window.innerWidth  * 0.02);
+        const cy = settings.compactY ?? Math.round(window.innerHeight * 0.04);
+        tablet.style.left = cx + 'px';
+        tablet.style.top  = cy + 'px';
+
+        tablet.classList.add('quarter-screen');
+        ov.classList.add('compact-mode');
+        attachTabletDrag();
+
+        toggle.style.background  = ACCENT_COLOR + '33';
+        toggle.style.borderColor = ACCENT_COLOR;
+        knob.style.transform     = 'translateX(24px)';
+        knob.style.background    = ACCENT_COLOR;
+        label.textContent        = 'COMPACT';
+        label.style.color        = ACCENT_COLOR;
+      } else {
+        tablet.classList.remove('quarter-screen');
+        ov.classList.remove('compact-mode');
+        // Reset inline position so the overlay flex-centre takes over again
+        tablet.style.left = '';
+        tablet.style.top  = '';
+        detachTabletDrag();
+
+        toggle.style.background  = '#0a1928';
+        toggle.style.borderColor = '#1e3d58';
+        knob.style.transform     = 'translateX(0)';
+        knob.style.background    = '#4a7a9a';
+        label.textContent        = 'NORMAL';
+        label.style.color        = '#7fb3cc';
+      }
+
+      if (map) setTimeout(() => map.invalidateSize(true), 60);
+    }
+
+    toggle.addEventListener('click', () => applySize(!settings.quarterScreen));
+    // Restore saved preference on load
+    if (settings.quarterScreen) applySize(true);
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
   //  TAB SWITCHING
   // ════════════════════════════════════════════════════════════════════════════
   function switchTab(tab) {
@@ -1246,6 +1416,7 @@
     });
 
     makeDraggable(btn);
+    initSizeToggle();
 
     await initFirebase();
     startClock();
@@ -1261,5 +1432,3 @@
   }, 500);
 
 })();
-
-
