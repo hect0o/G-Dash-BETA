@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         G-Dash
+// @name         G-DASH
 // @namespace    https://github.com/hect0o
-// @version      1.0.2
-// @description  Tablet-style dashboard for GeoFS — live map, flight logbook, multi-pilot support
+// @version      2.0.0
+// @description  Apex Airways dashboard for GeoFS — Discord login, live map, sessions, flight logbook
 // @author       hecto.oooo
 // @match        https://www.geo-fs.com/geofs.php*
 // @match        https://geo-fs.com/geofs.php*
@@ -32,41 +32,32 @@
   const ACCENT_COLOR = '#00c8ff';
 
   // ════════════════════════════════════════════════════════════════════════════
-  //  🔥  FIREBASE CONFIG
+  //  🔥  FIREBASE + APEX (Discord OAuth) — fill in before use
   // ════════════════════════════════════════════════════════════════════════════
   const FIREBASE_CONFIG = {
-    apiKey:            "AIzaSyCEpPgpxeBunGfGCrLBl9NkIdSJ4yEGrlQ",
-    authDomain:        "geo-fs-dashboard.firebaseapp.com",
-    projectId:         "geo-fs-dashboard",
-    storageBucket:     "geo-fs-dashboard.firebasestorage.app",
-    messagingSenderId: "803779500111",
-    appId:             "1:803779500111:web:9a535352aea51c6c68b23a"
+    apiKey:            "AIzaSyAQW_h_WLvRJE96j4E827ISKedMfYCFpA4",
+    authDomain:        "apex-airways-5a1a7.firebaseapp.com",
+    projectId:         "apex-airways-5a1a7",
+    storageBucket:     "apex-airways-5a1a7.firebasestorage.app",
+    messagingSenderId: "145179688972",
+    appId:             "1:145179688972:web:f40227971d9ab4fc17ee29"
   };
 
-  // ════════════════════════════════════════════════════════════════════════════
-  //  PILOT ID
-  // ════════════════════════════════════════════════════════════════════════════
-  function getPilotId() {
-    const KEY = 'gfs_pilot_id';
-    let id = localStorage.getItem(KEY);
-    if (!id) {
-      const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-      let s = '';
-      for (let i = 0; i < 6; i++) s += chars[Math.floor(Math.random() * chars.length)];
-      id = 'PILOT-' + s;
-      localStorage.setItem(KEY, id);
-    }
-    return id;
-  }
-  function getPilotJoinDate() {
-    const KEY = 'gfs_pilot_joined';
-    let d = localStorage.getItem(KEY);
-    if (!d) { d = new Date().toISOString(); localStorage.setItem(KEY, d); }
-    return d;
-  }
+  const APEX_CONFIG = {
+    discordClientId:      "1508516763300659420",
+    // Must match Discord Developer Portal → OAuth2 → Redirects (host public/oauth/callback.html)
+    discordRedirectUri:   "https://g-dash.pages.dev/",
+    sessionHeartbeatMs:   60_000,
+    phaseDebounceMs:      3_000,
+  };
 
-  const PILOT_ID  = getPilotId();
-  const JOIN_DATE = getPilotJoinDate();
+  const APEX_STORAGE = {
+    DISCORD_ID: 'apex_discord_id',
+    REFRESH:    'apex_discord_refresh',
+  };
+
+  const COLLECTIONS = { PILOTS: 'pilots', SESSIONS: 'sessions' };
+  const FLIGHT_PHASES = ['ground','taxi','takeoff','climb','cruise','descent','approach','landing','unknown'];
 
   // ════════════════════════════════════════════════════════════════════════════
   //  SETTINGS — persisted in localStorage
@@ -98,6 +89,17 @@
   let totalDistNm = 0, maxAlt = 0, maxSpd = 0;
   let currentHeading = 0;
 
+  /** @type {{ discordId: string, profile: object|null, username: string }|null} */
+  let authUser = null;
+  let firebaseAuth = null;
+  let apexSessionId = null;
+  let apexFlightPhase = 'ground';
+  let apexPhaseDebounceTimer = null;
+  let apexHeartbeatTimer = null;
+  let apexPilotUnsub = null;
+  let apexSessionUnsub = null;
+  let lastPlaneSample = null;
+
   // ════════════════════════════════════════════════════════════════════════════
   //  LIBRARY LOADERS
   // ════════════════════════════════════════════════════════════════════════════
@@ -109,9 +111,23 @@
     });
   }
   async function loadFirebase() {
-    if (window.firebase?.firestore) return;
-    await loadScript('https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js');
-    await loadScript('https://www.gstatic.com/firebasejs/9.23.0/firebase-firestore-compat.js');
+    if (window.firebase?.auth && window.firebase?.firestore) return;
+    const v = '10.14.1';
+    await loadScript(`https://www.gstatic.com/firebasejs/${v}/firebase-app-compat.js`);
+    await loadScript(`https://www.gstatic.com/firebasejs/${v}/firebase-auth-compat.js`);
+    await loadScript(`https://www.gstatic.com/firebasejs/${v}/firebase-firestore-compat.js`);
+  }
+
+  function getDiscordId() {
+    return authUser?.discordId || localStorage.getItem(APEX_STORAGE.DISCORD_ID) || null;
+  }
+
+  function getLinkedUid() {
+    return firebaseAuth?.currentUser?.uid || null;
+  }
+
+  function isLoggedIn() {
+    return !!getDiscordId() && !!getLinkedUid();
   }
   async function loadLeaflet() {
     if (window.L) return;
@@ -120,6 +136,538 @@
     css.href = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css';
     document.head.appendChild(css);
     await loadScript('https://unpkg.com/leaflet@1.9.4/dist/leaflet.js');
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
+  //  APEX AIRWAYS — AUTH + SESSION
+  // ════════════════════════════════════════════════════════════════════════════
+  function assertApexConfig() {
+    const missing = [];
+    if (!APEX_CONFIG.discordClientId || APEX_CONFIG.discordClientId.startsWith('YOUR_')) missing.push('discordClientId');
+    if (!APEX_CONFIG.discordRedirectUri || APEX_CONFIG.discordRedirectUri.includes('your-project')) missing.push('discordRedirectUri');
+    if (missing.length) console.warn('[Apex] Configure APEX_CONFIG:', missing.join(', '));
+  }
+
+  function base64UrlEncode(bytes) {
+    let bin = '';
+    const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+    for (let i = 0; i < arr.length; i++) bin += String.fromCharCode(arr[i]);
+    return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  }
+
+  function randomPkceVerifier() {
+    const a = new Uint8Array(32);
+    crypto.getRandomValues(a);
+    return base64UrlEncode(a);
+  }
+
+  async function pkceChallenge(verifier) {
+    const data = new TextEncoder().encode(verifier);
+    const hash = await crypto.subtle.digest('SHA-256', data);
+    return base64UrlEncode(new Uint8Array(hash));
+  }
+
+  function discordAvatarUrl(userId, avatarHash) {
+    if (!avatarHash) return `https://cdn.discordapp.com/embed/avatars/${Number(userId) % 5}.png`;
+    return `https://cdn.discordapp.com/avatars/${userId}/${avatarHash}.png`;
+  }
+
+  function pilotFromDiscordUser(u) {
+    return {
+      discordId: u.id,
+      username: u.username,
+      globalName: u.global_name ?? null,
+      discriminator: u.discriminator ?? null,
+      avatarUrl: discordAvatarUrl(u.id, u.avatar),
+    };
+  }
+
+  function inferFlightPhase(d, prev) {
+    if (!d) return 'unknown';
+    const alt = d.altFt;
+    const spd = d.speedKts;
+    const vspd = prev ? alt - prev.altFt : 0;
+
+    if (alt < 80 && spd < 30) return 'ground';
+    if (alt < 1200 && spd >= 20 && spd < 65 && Math.abs(vspd) < 35) return 'taxi';
+    if (vspd > 120 && alt < 5000) return 'takeoff';
+    if (vspd > 25 && alt >= 800) return 'climb';
+    if (vspd < -25 && alt >= 800) return 'descent';
+    if (alt >= 1800 && spd >= 70 && Math.abs(vspd) < 30) return 'cruise';
+    if (vspd < -15 && alt < 2200 && alt > 250) return 'approach';
+    if (alt < 450 && (vspd < -8 || spd < 90)) return 'landing';
+    if (alt < 1000 && spd < 75) return 'taxi';
+    if (spd >= 55) return 'cruise';
+    return 'ground';
+  }
+
+  async function buildDiscordAuthUrl(state, codeChallenge) {
+    const p = new URLSearchParams({
+      client_id: APEX_CONFIG.discordClientId,
+      redirect_uri: APEX_CONFIG.discordRedirectUri,
+      response_type: 'code',
+      scope: 'identify',
+      state,
+      code_challenge: codeChallenge,
+      code_challenge_method: 'S256',
+      prompt: 'none',
+    });
+    return `https://discord.com/api/oauth2/authorize?${p}`;
+  }
+
+  function requestDiscordCode() {
+    return new Promise(async (resolve, reject) => {
+      const state = Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2, '0')).join('');
+      const verifier = randomPkceVerifier();
+      const challenge = await pkceChallenge(verifier);
+      sessionStorage.setItem('apex_oauth_state', state);
+      sessionStorage.setItem('apex_pkce_verifier', verifier);
+      const authUrl = await buildDiscordAuthUrl(state, challenge);
+      const popup = window.open(authUrl, 'apex_discord_oauth',
+        `width=500,height=700,left=${(screen.width-500)/2},top=${(screen.height-700)/2}`);
+      if (!popup) return reject(new Error('Popup blocked — allow popups for GeoFS'));
+
+      const timeout = setTimeout(() => { cleanup(); reject(new Error('Discord login timed out')); }, 120000);
+      const poll = setInterval(() => {
+        if (popup.closed) { cleanup(); reject(new Error('Login window closed')); }
+      }, 500);
+
+      function cleanup() {
+        clearTimeout(timeout); clearInterval(poll);
+        window.removeEventListener('message', onMsg);
+        try { popup.close(); } catch (_) {}
+      }
+
+      function onMsg(event) {
+        let ok = event.origin === window.location.origin;
+        try { if (!ok) ok = new URL(APEX_CONFIG.discordRedirectUri).origin === event.origin; } catch (_) {}
+        if (!ok || !event.data || event.data.type !== 'APEX_DISCORD_OAUTH') return;
+        cleanup();
+        if (event.data.error) return reject(new Error(event.data.error));
+        if (event.data.state !== sessionStorage.getItem('apex_oauth_state')) return reject(new Error('Invalid OAuth state'));
+        sessionStorage.removeItem('apex_oauth_state');
+        if (!event.data.code) return reject(new Error('Login cancelled'));
+        resolve(event.data.code);
+      }
+      window.addEventListener('message', onMsg);
+    });
+  }
+
+  /** Discord token exchange — client-side PKCE (no backend / authApiBase). */
+  async function exchangeDiscordCodePkce(code) {
+    const verifier = sessionStorage.getItem('apex_pkce_verifier');
+    sessionStorage.removeItem('apex_pkce_verifier');
+    if (!verifier) throw new Error('OAuth session expired — try again');
+
+    const res = await fetch('https://discord.com/api/oauth2/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        client_id: APEX_CONFIG.discordClientId,
+        grant_type: 'authorization_code',
+        code,
+        redirect_uri: APEX_CONFIG.discordRedirectUri,
+        code_verifier: verifier,
+      }),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body.error_description || body.error || `Discord token error ${res.status}`);
+    if (!body.access_token) throw new Error('No access token from Discord');
+    return body;
+  }
+
+  async function refreshDiscordToken(refreshToken) {
+    const res = await fetch('https://discord.com/api/oauth2/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        client_id: APEX_CONFIG.discordClientId,
+        grant_type: 'refresh_token',
+        refresh_token: refreshToken,
+      }),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body.error_description || 'Discord refresh failed');
+    if (body.refresh_token) localStorage.setItem(APEX_STORAGE.REFRESH, body.refresh_token);
+    return body.access_token;
+  }
+
+  async function fetchDiscordUser(accessToken) {
+    const res = await fetch('https://discord.com/api/users/@me', {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    const user = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(user.message || 'Failed to load Discord profile');
+    return user;
+  }
+
+  async function ensureFirebaseAnon() {
+    if (firebaseAuth.currentUser) return firebaseAuth.currentUser;
+    try {
+      await firebaseAuth.signInAnonymously();
+      return firebaseAuth.currentUser;
+    } catch (err) {
+      const code = err?.code || '';
+      if (code === 'auth/configuration-not-found' || code === 'auth/operation-not-allowed') {
+        throw new Error(
+          'Firebase Anonymous sign-in is not enabled. Open Firebase Console → Authentication → Sign-in method → Anonymous → Enable. See apex-airways/FIREBASE_SETUP.md'
+        );
+      }
+      throw err;
+    }
+  }
+
+  async function savePilotProfile(pilot) {
+    const id = pilot.discordId;
+    await ensureFirebaseAnon();
+    const uid = firebaseAuth.currentUser.uid;
+    const ref = db.collection(COLLECTIONS.PILOTS).doc(id);
+    const joinKey = 'apex_joined_' + id;
+    const data = {
+      discordId: id,
+      username: pilot.username,
+      globalName: pilot.globalName ?? null,
+      avatarUrl: pilot.avatarUrl ?? null,
+      discriminator: pilot.discriminator ?? null,
+      linkedUid: uid,
+      lastLoginAt: firebase.firestore.FieldValue.serverTimestamp(),
+      online: true,
+    };
+    if (!localStorage.getItem(joinKey)) {
+      data.joinedAt = firebase.firestore.FieldValue.serverTimestamp();
+      localStorage.setItem(joinKey, new Date().toISOString());
+    }
+    await ref.set(data, { merge: true });
+    return data;
+  }
+
+  async function setPilotOffline(discordId) {
+    if (!db || !discordId) return;
+    try {
+      await db.collection(COLLECTIONS.PILOTS).doc(discordId).update({
+        online: false,
+        lastSeenAt: firebase.firestore.FieldValue.serverTimestamp(),
+      });
+    } catch (_) {}
+  }
+
+  async function getPilotProfile(discordId) {
+    try {
+      const snap = await db.collection(COLLECTIONS.PILOTS).doc(discordId).get();
+      return snap.exists ? snap.data() : null;
+    } catch (e) {
+      if (isPermissionError(e)) throw permissionHelpError(e);
+      throw e;
+    }
+  }
+
+  function isPermissionError(e) {
+    const msg = String(e?.message || e?.code || e || '');
+    return msg.includes('permission') || msg.includes('PERMISSION_DENIED') || e?.code === 'permission-denied';
+  }
+
+  function permissionHelpError(original) {
+    const err = new Error(
+      'Firestore blocked this action. In Firebase Console open project apex-airways-5a1a7 → Firestore → Rules, paste rules from apex-airways/firestore.rules, click Publish. Also enable Authentication → Anonymous.'
+    );
+    err.cause = original;
+    return err;
+  }
+
+  function updateAuthUI() {
+    const chip = document.getElementById('gfs-pilot-chip');
+    const label = document.getElementById('gfs-pilot-label');
+    const gate = document.getElementById('gfs-auth-gate');
+    const tabs = document.getElementById('gfs-tabs');
+    const content = document.getElementById('gfs-content');
+    const loginBtn = document.getElementById('gfs-login-btn');
+    const logoutBtn = document.getElementById('gfs-logout-btn');
+    const dot = document.getElementById('gfs-dot');
+
+    if (authUser) {
+      const name = authUser.profile?.globalName || authUser.profile?.username || authUser.username || 'Pilot';
+      if (chip) chip.textContent = name;
+      if (label) label.textContent = 'SIGNED IN';
+      if (gate) gate.style.display = 'none';
+      if (tabs) tabs.style.pointerEvents = '';
+      if (content) content.style.pointerEvents = '';
+      if (loginBtn) loginBtn.style.display = 'none';
+      if (logoutBtn) logoutBtn.style.display = '';
+      if (dot) { dot.style.background = '#00ff88'; dot.title = 'Online'; }
+
+      const av = document.getElementById('gfs-pilot-avatar');
+      const pcId = document.querySelector('.pc-id');
+      const piJoined = document.getElementById('pi-joined');
+      if (pcId) pcId.textContent = name;
+      if (av && authUser.profile?.avatarUrl) {
+        av.innerHTML = `<img src="${authUser.profile.avatarUrl}" alt="" style="width:100%;height:100%;border-radius:10px;object-fit:cover"/>`;
+      }
+      if (piJoined && authUser.profile?.joinedAt) {
+        const jd = authUser.profile.joinedAt.toDate ? authUser.profile.joinedAt.toDate() : new Date(authUser.profile.joinedAt);
+        setText('pi-joined', jd.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }));
+      }
+      setText('pi-discord-id', authUser.discordId);
+    } else {
+      if (chip) chip.textContent = 'Guest';
+      if (label) label.textContent = 'NOT SIGNED IN';
+      if (gate) gate.style.display = 'flex';
+      if (loginBtn) loginBtn.style.display = '';
+      if (logoutBtn) logoutBtn.style.display = 'none';
+      if (dot) { dot.style.background = '#ff6666'; dot.title = 'Offline'; }
+    }
+    setText('gfs-phase', apexFlightPhase.toUpperCase());
+  }
+
+  function debouncePhaseWrite(fn, ms) {
+    return function (phase) {
+      if (apexPhaseDebounceTimer) clearTimeout(apexPhaseDebounceTimer);
+      apexPhaseDebounceTimer = setTimeout(() => fn(phase), ms);
+    };
+  }
+
+  let lastPersistedPhase = null;
+
+  const persistFlightPhaseDb = debouncePhaseWrite(async (phase) => {
+    if (!apexSessionId || !db || phase === lastPersistedPhase) return;
+    lastPersistedPhase = phase;
+    try {
+      await db.collection(COLLECTIONS.SESSIONS).doc(apexSessionId).update({
+        flightPhase: phase,
+        lastSeenAt: firebase.firestore.FieldValue.serverTimestamp(),
+      });
+    } catch (e) { console.warn('[Apex] phase write failed', e); }
+  }, APEX_CONFIG.phaseDebounceMs);
+
+  function displayFlightPhase(phase) {
+    if (!FLIGHT_PHASES.includes(phase)) phase = 'unknown';
+    apexFlightPhase = phase;
+    const label = phase.toUpperCase();
+    setText('gfs-phase', label);
+    setText('h-phase', label);
+  }
+
+  function setFlightPhase(phase, persistToDb) {
+    displayFlightPhase(phase);
+    if (persistToDb !== false && apexSessionId) persistFlightPhaseDb(phase);
+  }
+
+  async function endStaleSessions(discordId) {
+    const uid = getLinkedUid();
+    if (!uid) return;
+    let snap;
+    try {
+      snap = await db.collection(COLLECTIONS.SESSIONS)
+        .where('pilotId', '==', discordId)
+        .where('online', '==', true)
+        .limit(5)
+        .get();
+    } catch (e) {
+      console.warn('[Apex] endStaleSessions query', e);
+      return;
+    }
+    if (snap.empty) return;
+    const batch = db.batch();
+    const ts = firebase.firestore.FieldValue.serverTimestamp();
+    snap.docs.forEach(d => batch.update(d.ref, { online: false, endedAt: ts, lastSeenAt: ts }));
+    await batch.commit();
+  }
+
+  async function startApexSession() {
+    const discordId = getDiscordId();
+    const uid = getLinkedUid();
+    if (!discordId || !uid || !db) throw new Error('Login required');
+    if (apexSessionId) return apexSessionId;
+
+    try {
+      await endStaleSessions(discordId);
+    } catch (e) {
+      console.warn('[Apex] endStaleSessions skipped', e);
+    }
+    const ref = db.collection(COLLECTIONS.SESSIONS).doc();
+    await ref.set({
+      pilotId: discordId,
+      linkedUid: uid,
+      online: true,
+      flightPhase: 'ground',
+      startedAt: firebase.firestore.FieldValue.serverTimestamp(),
+      endedAt: null,
+      lastSeenAt: firebase.firestore.FieldValue.serverTimestamp(),
+    });
+    apexSessionId = ref.id;
+    lastPersistedPhase = null;
+    displayFlightPhase('ground');
+
+    if (apexHeartbeatTimer) clearInterval(apexHeartbeatTimer);
+    apexHeartbeatTimer = setInterval(async () => {
+      if (!apexSessionId || !db) return;
+      try {
+        await db.collection(COLLECTIONS.SESSIONS).doc(apexSessionId).update({
+          lastSeenAt: firebase.firestore.FieldValue.serverTimestamp(),
+        });
+      } catch (_) {}
+    }, APEX_CONFIG.sessionHeartbeatMs);
+
+    watchApexSession(apexSessionId);
+    return apexSessionId;
+  }
+
+  async function endApexSession() {
+    if (apexPhaseDebounceTimer) clearTimeout(apexPhaseDebounceTimer);
+    if (apexHeartbeatTimer) { clearInterval(apexHeartbeatTimer); apexHeartbeatTimer = null; }
+
+    if (!apexSessionId || !db) { apexSessionId = null; return; }
+
+    try {
+      await db.collection(COLLECTIONS.SESSIONS).doc(apexSessionId).update({
+        online: false,
+        flightPhase: apexFlightPhase,
+        endedAt: firebase.firestore.FieldValue.serverTimestamp(),
+        lastSeenAt: firebase.firestore.FieldValue.serverTimestamp(),
+      });
+    } catch (e) { console.warn('[Apex] end session failed', e); }
+
+    if (apexSessionUnsub) { apexSessionUnsub(); apexSessionUnsub = null; }
+    apexSessionId = null;
+    setText('gfs-phase', '—');
+  }
+
+  function watchApexPilot(discordId) {
+    if (apexPilotUnsub) apexPilotUnsub();
+    apexPilotUnsub = db.collection(COLLECTIONS.PILOTS).doc(discordId)
+      .onSnapshot(snap => {
+        if (!snap.exists || !authUser) return;
+        authUser.profile = snap.data();
+        updateAuthUI();
+      }, err => console.warn('[Apex] pilot sync', err));
+  }
+
+  function watchApexSession(sessionId) {
+    if (apexSessionUnsub) apexSessionUnsub();
+    apexSessionUnsub = db.collection(COLLECTIONS.SESSIONS).doc(sessionId)
+      .onSnapshot(snap => {
+        if (!snap.exists) return;
+        const d = snap.data();
+        if (d.flightPhase) {
+          apexFlightPhase = d.flightPhase;
+          setText('gfs-phase', d.flightPhase.toUpperCase());
+        }
+      }, err => console.warn('[Apex] session sync', err));
+  }
+
+  async function restoreApexUser() {
+    const discordId = localStorage.getItem(APEX_STORAGE.DISCORD_ID);
+    if (!discordId) return null;
+
+    await ensureFirebaseAnon();
+    const profile = await getPilotProfile(discordId).catch(() => null);
+    if (!profile) {
+      localStorage.removeItem(APEX_STORAGE.DISCORD_ID);
+      return null;
+    }
+
+    if (profile.linkedUid !== firebaseAuth.currentUser.uid) {
+      try {
+        await db.collection(COLLECTIONS.PILOTS).doc(discordId).set({
+          linkedUid: firebaseAuth.currentUser.uid,
+        }, { merge: true });
+        profile.linkedUid = firebaseAuth.currentUser.uid;
+      } catch (e) {
+        console.warn('[Apex] relink pilot', e);
+      }
+    }
+
+    authUser = {
+      discordId,
+      username: profile.username || profile.globalName || 'Pilot',
+      profile,
+    };
+    return authUser;
+  }
+
+  async function loginWithDiscord() {
+    assertApexConfig();
+    setText('gfs-auth-status', 'Opening Discord…');
+    const code = await requestDiscordCode();
+    setText('gfs-auth-status', 'Signing in…');
+
+    const tokens = await exchangeDiscordCodePkce(code);
+    if (tokens.refresh_token) localStorage.setItem(APEX_STORAGE.REFRESH, tokens.refresh_token);
+
+    const discordUser = await fetchDiscordUser(tokens.access_token);
+    const pilot = pilotFromDiscordUser(discordUser);
+
+    await ensureFirebaseAnon();
+    await savePilotProfile(pilot);
+    localStorage.setItem(APEX_STORAGE.DISCORD_ID, pilot.discordId);
+
+    const profile = await getPilotProfile(pilot.discordId);
+    authUser = {
+      discordId: pilot.discordId,
+      username: pilot.username,
+      profile,
+    };
+    updateAuthUI();
+    watchApexPilot(pilot.discordId);
+    try {
+      await loadFlights();
+    } catch (e) {
+      console.error('[Apex] loadFlights', e);
+      setText('gfs-auth-status', e.message || 'Could not load logbook');
+      throw e;
+    }
+    setText('gfs-auth-status', '');
+    console.log('[Apex] login OK | project:', FIREBASE_CONFIG.projectId, '| uid:', getLinkedUid(), '| discord:', pilot.discordId);
+    return authUser;
+  }
+
+  async function logoutApex() {
+    if (flightActive) await stopFlight();
+    await endApexSession();
+    const id = getDiscordId();
+    await setPilotOffline(id);
+    if (apexPilotUnsub) { apexPilotUnsub(); apexPilotUnsub = null; }
+    localStorage.removeItem(APEX_STORAGE.DISCORD_ID);
+    localStorage.removeItem(APEX_STORAGE.REFRESH);
+    await firebaseAuth.signOut();
+    authUser = null;
+    allFlights = [];
+    renderLogbook();
+    renderAllTime();
+    updateAuthUI();
+  }
+
+  async function initApexAuth() {
+    assertApexConfig();
+    if (!firebase.apps.length) firebase.initializeApp(FIREBASE_CONFIG);
+    firebaseAuth = firebase.auth();
+    firebaseAuth.setPersistence(firebase.auth.Auth.Persistence.LOCAL);
+    db = firebase.firestore();
+
+    try {
+      const refresh = localStorage.getItem(APEX_STORAGE.REFRESH);
+      const discordId = localStorage.getItem(APEX_STORAGE.DISCORD_ID);
+      if (discordId && refresh) {
+        await refreshDiscordToken(refresh).catch(() => {
+          localStorage.removeItem(APEX_STORAGE.REFRESH);
+        });
+      }
+      if (discordId) {
+        if (!firebaseAuth.currentUser) await firebaseAuth.signInAnonymously();
+        const restored = await restoreApexUser();
+        if (restored) {
+          updateAuthUI();
+          watchApexPilot(restored.discordId);
+          await loadFlights().catch(() => {});
+          return restored;
+        }
+      }
+    } catch (e) {
+      console.warn('[Apex] auto-reconnect failed', e);
+    }
+
+    authUser = null;
+    updateAuthUI();
+    return null;
   }
 
   // ════════════════════════════════════════════════════════════════════════════
@@ -222,15 +770,16 @@
         animation:gfs-pop .32s cubic-bezier(.22,1,.36,1);
         transition:width .3s ease, height .3s ease, max-width .3s ease, max-height .3s ease;
       }
-      /* ✅ Quarter-screen compact mode — floats freely over game */
+      /* Compact portrait mode — tall phone-style panel over the game */
       #gfs-tablet.quarter-screen {
         position:fixed !important;
-        width:50vw !important;
-        max-width:50vw !important;
-        min-width:0 !important;
-        height:50vh !important;
-        max-height:50vh !important;
-        min-height:0 !important;
+        width:min(92vw, 400px) !important;
+        max-width:400px !important;
+        min-width:300px !important;
+        height:min(88vh, 860px) !important;
+        max-height:88vh !important;
+        min-height:520px !important;
+        border-radius:22px;
         pointer-events:auto;
         cursor:default;
         z-index:99999;
@@ -238,6 +787,64 @@
       #gfs-tablet.quarter-screen.tablet-dragging {
         cursor:grabbing !important;
         opacity:.92;
+      }
+      #gfs-tablet.quarter-screen #gfs-topbar {
+        padding:10px 14px;
+        gap:6px;
+        cursor:grab;
+        user-select:none;
+        touch-action:none;
+      }
+      #gfs-tablet.quarter-screen #gfs-topbar.tablet-dragging {
+        cursor:grabbing;
+      }
+      #gfs-map, #gfs-map .leaflet-container {
+        pointer-events:auto !important;
+        touch-action:none;
+      }
+      #gfs-tablet.quarter-screen #gfs-logo {
+        font-size:11px;
+        letter-spacing:2px;
+      }
+      #gfs-tablet.quarter-screen #gfs-pilot-label { display:none; }
+      #gfs-tablet.quarter-screen #gfs-pilot-chip {
+        font-size:9px;
+        padding:3px 8px;
+        max-width:88px;
+        overflow:hidden;
+        text-overflow:ellipsis;
+        white-space:nowrap;
+      }
+      #gfs-tablet.quarter-screen #gfs-auth-btns button {
+        padding:5px 8px;
+        font-size:7px;
+      }
+      #gfs-tablet.quarter-screen #gfs-tabs {
+        padding:0 10px;
+        overflow-x:auto;
+      }
+      #gfs-tablet.quarter-screen .gfs-tab {
+        padding:9px 14px;
+        font-size:9px;
+        letter-spacing:1.5px;
+      }
+      #gfs-tablet.quarter-screen #gfs-hud {
+        top:10px; left:10px; right:10px;
+        min-width:0; max-width:none; width:auto;
+        padding:10px 12px;
+      }
+      #gfs-tablet.quarter-screen .hud-val { font-size:13px; }
+      #gfs-tablet.quarter-screen #gfs-center {
+        width:36px; height:36px; font-size:17px;
+      }
+      #gfs-tablet.quarter-screen #gfs-footer {
+        padding:6px 14px;
+        flex-wrap:wrap;
+        gap:4px;
+      }
+      #gfs-tablet.quarter-screen #gfs-coords {
+        font-size:10px;
+        width:100%;
       }
       @keyframes gfs-pop {
         from{transform:translateY(38px) scale(.96);opacity:0}
@@ -282,6 +889,44 @@
         transition:background .15s,border-color .15s;
       }
       #gfs-close:hover{background:rgba(255,65,65,.28);border-color:#ff6666;}
+
+      #gfs-auth-btns { display:flex; gap:8px; align-items:center; }
+      #gfs-login-btn, #gfs-logout-btn {
+        padding:6px 12px; border-radius:8px; cursor:pointer;
+        font-family:'Orbitron',monospace; font-size:8px; font-weight:700; letter-spacing:1.5px;
+        border:1.5px solid #1e3d58; background:transparent; color:#7fb3cc;
+        transition:all .15s;
+      }
+      #gfs-login-btn { border-color:#5865F2; color:#aab4ff; }
+      #gfs-login-btn:hover { background:#5865F222; }
+      #gfs-logout-btn { border-color:rgba(255,80,80,.4); color:#ff8888; }
+      #gfs-logout-btn:hover { background:rgba(255,80,80,.15); }
+
+      #gfs-auth-gate {
+        position:absolute; inset:0; z-index:700;
+        display:flex; flex-direction:column; align-items:center; justify-content:center;
+        background:rgba(4,9,18,.97); text-align:center; padding:32px;
+      }
+      #gfs-auth-gate h2 {
+        font-family:'Orbitron',monospace; font-size:16px; color:${A};
+        letter-spacing:3px; margin:0 0 12px;
+      }
+      #gfs-auth-gate p {
+        font-size:13px; color:#7fb3cc; max-width:320px; line-height:1.7; margin:0 0 24px;
+      }
+      #gfs-discord-login {
+        padding:12px 28px; border-radius:10px; border:none; cursor:pointer;
+        background:#5865F2; color:#fff; font-family:'Orbitron',monospace;
+        font-size:10px; font-weight:700; letter-spacing:2px;
+        box-shadow:0 0 20px #5865F244;
+      }
+      #gfs-discord-login:hover { filter:brightness(1.1); }
+      #gfs-auth-status { font-size:11px; color:#5a8aa8; margin-top:14px; min-height:18px; }
+
+      #gfs-phase {
+        font-family:'Orbitron',monospace; font-size:9px; font-weight:700;
+        color:#ffb800; letter-spacing:2px; margin-left:12px;
+      }
 
       #gfs-tabs {
         display:flex; background:#050e1a;
@@ -658,9 +1303,13 @@
             ${DASHBOARD_NAME}
           </div>
           <div id="gfs-pilot-badge">
-            <span id="gfs-pilot-label">PILOT ID</span>
-            <span id="gfs-pilot-chip">${PILOT_ID}</span>
+            <span id="gfs-pilot-label">NOT SIGNED IN</span>
+            <span id="gfs-pilot-chip">Guest</span>
             <div id="gfs-dot"></div>
+          </div>
+          <div id="gfs-auth-btns">
+            <button id="gfs-login-btn" type="button">Discord</button>
+            <button id="gfs-logout-btn" type="button" style="display:none">Logout</button>
           </div>
           <button id="gfs-close">✕</button>
         </div>
@@ -692,6 +1341,13 @@
 
         <div id="gfs-content">
 
+          <div id="gfs-auth-gate">
+            <h2>◈ ${DASHBOARD_NAME}</h2>
+            <p>Sign in with Discord to sync your pilot profile, live sessions, and flight logbook across devices.</p>
+            <button id="gfs-discord-login" type="button">Login with Discord</button>
+            <div id="gfs-auth-status"></div>
+          </div>
+
           <!-- MAP PANEL -->
           <div class="gfs-panel active" id="gfs-panel-map">
             <div style="flex:1;position:relative;overflow:hidden;">
@@ -705,6 +1361,10 @@
                 <div class="hud-row">
                   <span class="hud-lbl">Airspeed</span>
                   <span class="hud-val g" id="h-spd">— kts</span>
+                </div>
+                <div class="hud-row">
+                  <span class="hud-lbl">Phase</span>
+                  <span class="hud-val y" id="h-phase">—</span>
                 </div>
                 <div id="hud-hdg-wrap">
                   <div id="hud-hdg-compass">
@@ -727,10 +1387,10 @@
               <div id="gfs-pilot-card">
                 <div id="gfs-pilot-avatar">✈</div>
                 <div>
-                  <div class="pc-id">${PILOT_ID}</div>
+                  <div class="pc-id">—</div>
                   <div class="pc-sub">
                     Member since <span id="pi-joined">—</span><br>
-                    Unique device ID · Saved to this browser
+                    Discord ID · <span id="pi-discord-id">—</span>
                   </div>
                 </div>
               </div>
@@ -811,6 +1471,16 @@
           <div class="gfs-panel" id="gfs-panel-settings">
             <div id="gfs-settings-body">
 
+              <div class="sec">◈ Account</div>
+              <div class="setting-row">
+                <div class="setting-label">Discord Authentication</div>
+                <div class="setting-desc">Login links your GeoFS logbook to your Discord account via Apex Airways. Logout ends your active session.</div>
+                <div style="display:flex;gap:10px;margin-top:8px;">
+                  <button class="gfs-btn btn-start" id="gfs-settings-login" type="button" style="flex:1">Login</button>
+                  <button class="gfs-btn btn-land" id="gfs-settings-logout" type="button" style="flex:1">Logout</button>
+                </div>
+              </div>
+
               <div class="sec">◈ Keyboard Shortcut</div>
               <div class="setting-row">
                 <div class="setting-label">Open / Close Keybind</div>
@@ -832,7 +1502,7 @@
               <div class="sec">◈ Dashboard Size</div>
               <div class="setting-row">
                 <div class="setting-label">Size Mode</div>
-                <div class="setting-desc">Toggle between the normal tablet size and a compact quarter-screen view that stays out of the way while you fly.</div>
+                <div class="setting-desc">Compact mode removes the blurred backdrop and shows a tall portrait panel you can drag over the game.</div>
                 <div style="display:flex;align-items:center;gap:14px;margin-top:4px;">
                   <span id="size-mode-label">NORMAL</span>
                   <div id="size-toggle">
@@ -848,7 +1518,10 @@
 
         <div id="gfs-footer">
           <div id="gfs-coords">LAT  —  |  LON  —</div>
-          <div id="gfs-utc">G-DASH</div>
+          <div style="display:flex;align-items:center;">
+            <span id="gfs-phase">—</span>
+            <span id="gfs-utc" style="margin-left:12px">G-DASH</span>
+          </div>
         </div>
       </div>
     `;
@@ -875,7 +1548,15 @@
   // ════════════════════════════════════════════════════════════════════════════
   function initMap() {
     if (map) return;
-    map = L.map('gfs-map', { center:[20,0], zoom:4, attributionControl:false });
+    map = L.map('gfs-map', {
+      center: [20, 0],
+      zoom: 4,
+      attributionControl: false,
+      dragging: true,
+      touchZoom: true,
+      scrollWheelZoom: true,
+      doubleClickZoom: true,
+    });
     L.tileLayer(MAP_TILE_URL, { maxZoom:19, minZoom:2 }).addTo(map);
 
     const A = ACCENT_COLOR;
@@ -931,7 +1612,10 @@
     if (posInterval) return;
     posInterval = setInterval(() => {
       const d = getPlaneData();
-      if (!d) return;
+      if (!d) {
+        displayFlightPhase('unknown');
+        return;
+      }
       lastPosition = d;
       currentHeading = d.heading;
 
@@ -944,6 +1628,11 @@
 
       planeMarker?.setLatLng([d.lat, d.lon]);
       rotatePlane(d.heading);
+
+      const phase = inferFlightPhase(d, lastPlaneSample);
+      lastPlaneSample = { altFt: d.altFt, speedKts: d.speedKts, lat: d.lat, lon: d.lon };
+      displayFlightPhase(phase);
+      if (apexSessionId) persistFlightPhaseDb(phase);
 
       if (flightActive) {
         if (flightPathCoords.length > 0) {
@@ -959,8 +1648,9 @@
         setText('sf-alt',  maxAlt.toLocaleString());
         setText('sf-spd',  maxSpd.toFixed(0));
 
-        if (currentFlightId && db && flightPathCoords.length % 30 === 0) {
-          db.collection('pilots').doc(PILOT_ID)
+        const pilotId = getDiscordId();
+        if (currentFlightId && db && pilotId && flightPathCoords.length % 30 === 0) {
+          db.collection('pilots').doc(pilotId)
             .collection('flights').doc(currentFlightId).update({
               lastLat:d.lat, lastLon:d.lon,
               maxAltitude:maxAlt, maxSpeed:maxSpd,
@@ -973,35 +1663,22 @@
   }
 
   // ════════════════════════════════════════════════════════════════════════════
-  //  FIREBASE
+  //  FIREBASE — FLIGHT LOGBOOK (requires Discord login)
   // ════════════════════════════════════════════════════════════════════════════
-  async function initFirebase() {
-    try {
-      if (!firebase.apps.length) firebase.initializeApp(FIREBASE_CONFIG);
-      db = firebase.firestore();
-      const pilotRef  = db.collection('pilots').doc(PILOT_ID);
-      const pilotSnap = await pilotRef.get();
-      if (!pilotSnap.exists) {
-        await pilotRef.set({
-          pilotId: PILOT_ID,
-          joinedAt: firebase.firestore.FieldValue.serverTimestamp(),
-          joinedLocal: JOIN_DATE
-        });
-      }
-      await loadFlights();
-    } catch (e) { console.error('[G-Dash] Firebase error:', e); }
-  }
-
   async function loadFlights() {
-    if (!db) return;
+    const pilotId = getDiscordId();
+    if (!db || !pilotId) return;
     try {
-      const snap = await db.collection('pilots').doc(PILOT_ID)
+      const snap = await db.collection('pilots').doc(pilotId)
         .collection('flights')
         .orderBy('startTime','desc').limit(25).get();
       allFlights = snap.docs.map(d => ({ id:d.id, ...d.data() }));
       renderAllTime();
       renderLogbook();
-    } catch (e) { console.warn('[G-Dash] Load error:', e); }
+    } catch (e) {
+      console.error('[G-Dash] Load error:', e);
+      if (isPermissionError(e)) throw permissionHelpError(e);
+    }
   }
 
   function renderAllTime() {
@@ -1022,9 +1699,10 @@
     document.getElementById('gfs-confirm-modal').style.display = 'none';
   }
   async function confirmDelete() {
-    if (!pendingDeleteId || !db) return hideDeleteConfirm();
+    const pilotId = getDiscordId();
+    if (!pendingDeleteId || !db || !pilotId) return hideDeleteConfirm();
     try {
-      await db.collection('pilots').doc(PILOT_ID)
+      await db.collection('pilots').doc(pilotId)
         .collection('flights').doc(pendingDeleteId).delete();
     } catch (e) { console.warn('[G-Dash] Delete error:', e); }
     hideDeleteConfirm();
@@ -1059,10 +1737,16 @@
   //  FLIGHT SESSION
   // ════════════════════════════════════════════════════════════════════════════
   async function startFlight() {
+    if (!isLoggedIn()) {
+      alert('Login with Discord to start a flight.');
+      return;
+    }
+
     flightActive = true;
     flightStartTime = Date.now();
     totalFlightSecs = 0; totalDistNm = 0; maxAlt = 0; maxSpd = 0;
     flightPathCoords = []; flightPath?.setLatLngs([]);
+    lastPlaneSample = null;
 
     setText('sf-dist','0.0'); setText('sf-alt','0'); setText('sf-spd','0');
 
@@ -1075,16 +1759,23 @@
       setText('gfs-timer', hhmmss(totalFlightSecs));
     }, 1000);
 
-    if (db) {
+    try {
+      await startApexSession();
+    } catch (e) {
+      console.warn('[Apex] session start failed', e);
+    }
+
+    const pilotId = getDiscordId();
+    if (db && pilotId) {
       try {
         const pos = getPlaneData();
-        const ref = await db.collection('pilots').doc(PILOT_ID)
+        const ref = await db.collection('pilots').doc(pilotId)
           .collection('flights').add({
             startTime:firebase.firestore.FieldValue.serverTimestamp(),
             startLat:pos?.lat??null, startLon:pos?.lon??null,
             durationSeconds:0, distanceNm:0,
             maxAltitude:0, maxSpeed:0,
-            status:'active', pilotId:PILOT_ID
+            status:'active', pilotId
           });
         currentFlightId = ref.id;
       } catch (e) { console.warn('[G-Dash] Create flight error:', e); }
@@ -1092,6 +1783,9 @@
   }
 
   async function stopFlight() {
+    if (!flightActive) return;
+
+    const savedDuration = totalFlightSecs;
     flightActive = false;
     clearInterval(timerInterval);
 
@@ -1101,11 +1795,14 @@
     setText('gfs-timer','00:00:00');
     totalFlightSecs = 0;
 
-    if (db && currentFlightId) {
+    await endApexSession();
+
+    const pilotId = getDiscordId();
+    if (db && currentFlightId && pilotId) {
       try {
-        await db.collection('pilots').doc(PILOT_ID)
+        await db.collection('pilots').doc(pilotId)
           .collection('flights').doc(currentFlightId).update({
-            durationSeconds: totalFlightSecs,
+            durationSeconds: savedDuration,
             distanceNm:      parseFloat(totalDistNm.toFixed(2)),
             maxAltitude:     maxAlt, maxSpeed:maxSpd,
             endTime:         firebase.firestore.FieldValue.serverTimestamp(),
@@ -1188,6 +1885,7 @@
 
     function onTabletMouseUp() {
       tablet.classList.remove('tablet-dragging');
+      document.getElementById('gfs-topbar')?.classList.remove('tablet-dragging');
       document.removeEventListener('mousemove', onTabletMouseMove);
       document.removeEventListener('mouseup',   onTabletMouseUp);
       if (tDragged) {
@@ -1198,17 +1896,18 @@
       }
     }
 
+    const topbarDrag = document.getElementById('gfs-topbar');
+
     function attachTabletDrag() {
-      tablet.addEventListener('mousedown', onTabletDragStart);
+      if (topbarDrag) topbarDrag.addEventListener('mousedown', onTabletDragStart);
     }
     function detachTabletDrag() {
-      tablet.removeEventListener('mousedown', onTabletDragStart);
+      if (topbarDrag) topbarDrag.removeEventListener('mousedown', onTabletDragStart);
     }
 
     function onTabletDragStart(e) {
-      // Only drag from the topbar, not buttons/inputs inside
-      const tag = e.target.tagName;
-      if (tag === 'BUTTON' || tag === 'INPUT' || tag === 'SELECT') return;
+      if (!settings.quarterScreen) return;
+      if (e.target.closest('button, input, select, a, #gfs-close')) return;
       if (e.button !== 0) return;
       tDragged = false;
       tStartX  = e.clientX;
@@ -1216,7 +1915,7 @@
       const r  = tablet.getBoundingClientRect();
       tStartL  = r.left;
       tStartT  = r.top;
-      tablet.classList.add('tablet-dragging');
+      topbarDrag?.classList.add('tablet-dragging');
       document.addEventListener('mousemove', onTabletMouseMove);
       document.addEventListener('mouseup',   onTabletMouseUp);
     }
@@ -1227,9 +1926,9 @@
       saveSettings(settings);
 
       if (quarter) {
-        // Position tablet before adding class so it lands somewhere sensible
-        const cx = settings.compactX ?? Math.round(window.innerWidth  * 0.02);
-        const cy = settings.compactY ?? Math.round(window.innerHeight * 0.04);
+        const panelW = Math.min(400, Math.round(window.innerWidth * 0.92));
+        const cx = settings.compactX ?? Math.max(8, window.innerWidth - panelW - 16);
+        const cy = settings.compactY ?? Math.round(window.innerHeight * 0.05);
         tablet.style.left = cx + 'px';
         tablet.style.top  = cy + 'px';
 
@@ -1241,7 +1940,7 @@
         toggle.style.borderColor = ACCENT_COLOR;
         knob.style.transform     = 'translateX(24px)';
         knob.style.background    = ACCENT_COLOR;
-        label.textContent        = 'COMPACT';
+        label.textContent        = 'PORTRAIT';
         label.style.color        = ACCENT_COLOR;
       } else {
         tablet.classList.remove('quarter-screen');
@@ -1259,7 +1958,13 @@
         label.style.color        = '#7fb3cc';
       }
 
-      if (map) setTimeout(() => map.invalidateSize(true), 60);
+      if (map) {
+        setTimeout(() => {
+          map.invalidateSize(true);
+          if (map.dragging && settings.quarterScreen) map.dragging.enable();
+        }, 80);
+        setTimeout(() => map.invalidateSize(true), 350);
+      }
     }
 
     toggle.addEventListener('click', () => applySize(!settings.quarterScreen));
@@ -1343,16 +2048,34 @@
   // ════════════════════════════════════════════════════════════════════════════
   //  MAIN INIT
   // ════════════════════════════════════════════════════════════════════════════
+  function bindAuthButtons() {
+    const doLogin = async () => {
+      try {
+        setText('gfs-auth-status', 'Connecting…');
+        await loginWithDiscord();
+      } catch (e) {
+        setText('gfs-auth-status', e.message || 'Login failed');
+        console.warn('[Apex] login', e);
+      }
+    };
+    const doLogout = async () => {
+      try { await logoutApex(); } catch (e) { console.warn('[Apex] logout', e); }
+    };
+
+    document.getElementById('gfs-discord-login')?.addEventListener('click', doLogin);
+    document.getElementById('gfs-login-btn')?.addEventListener('click', doLogin);
+    document.getElementById('gfs-settings-login')?.addEventListener('click', doLogin);
+    document.getElementById('gfs-logout-btn')?.addEventListener('click', doLogout);
+    document.getElementById('gfs-settings-logout')?.addEventListener('click', doLogout);
+  }
+
   async function init() {
     await loadLeaflet();
     await loadFirebase();
     injectStyles();
     buildDOM();
-
-    try {
-      const d = new Date(JOIN_DATE);
-      setText('pi-joined', d.toLocaleDateString('en-GB',{day:'2-digit',month:'short',year:'numeric'}));
-    } catch {}
+    bindAuthButtons();
+    updateAuthUI();
 
     const ov  = document.getElementById('gfs-overlay');
     const btn = document.getElementById('gfs-btn');
@@ -1361,7 +2084,12 @@
       ov.style.display = 'flex';
       if (!map) initMap();
       startPositionLoop();
-      setTimeout(() => { if (map) map.invalidateSize(true); }, 80);
+      setTimeout(() => {
+        if (map) {
+          map.invalidateSize(true);
+          if (map.dragging) map.dragging.enable();
+        }
+      }, 80);
       setTimeout(() => { if (map) map.invalidateSize(true); }, 350);
     }
     function closeDash() {
@@ -1398,8 +2126,8 @@
     document.querySelectorAll('.gfs-tab').forEach(t =>
       t.addEventListener('click', () => switchTab(t.dataset.tab)));
 
-    document.getElementById('gfs-start').addEventListener('click', startFlight);
-    document.getElementById('gfs-land').addEventListener('click',  stopFlight);
+    document.getElementById('gfs-start').addEventListener('click', () => startFlight().catch(console.warn));
+    document.getElementById('gfs-land').addEventListener('click', () => stopFlight().catch(console.warn));
 
     document.getElementById('confirm-yes-btn').addEventListener('click', confirmDelete);
     document.getElementById('confirm-no-btn').addEventListener('click',  hideDeleteConfirm);
@@ -1418,10 +2146,21 @@
     makeDraggable(btn);
     initSizeToggle();
 
-    await initFirebase();
+    await initApexAuth();
     startClock();
     updateSettingsUI();
-    console.log(`[G-Dash] ✅ Ready  |  Pilot: ${PILOT_ID}  |  Keybind: ${formatKey(settings.keybind)}`);
+
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'hidden' && apexSessionId && !flightActive) {
+        endApexSession().catch(() => {});
+      }
+    });
+    window.addEventListener('pagehide', () => {
+      if (apexSessionId && !flightActive) endApexSession().catch(() => {});
+    });
+
+    const pilot = getDiscordId();
+    console.log(`[Apex Airways] Ready  |  ${pilot ? 'Pilot ' + pilot : 'Guest — login required'}  |  Key: ${formatKey(settings.keybind)}`);
   }
 
   const waitReady = setInterval(() => {
