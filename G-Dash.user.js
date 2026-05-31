@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         G-DASH
 // @namespace    https://github.com/hect0o
-// @version      2.0.0
-// @description  Apex Airways dashboard for GeoFS — Discord login, live map, sessions, flight logbook
+// @version      2.1.0
+// @description  G-Dash dashboard for GeoFS — Discord login, live map, sessions, flight logbook
 // @author       hecto.oooo
 // @match        https://www.geo-fs.com/geofs.php*
 // @match        https://geo-fs.com/geofs.php*
@@ -16,9 +16,6 @@
 (function () {
   'use strict';
 
-  // ════════════════════════════════════════════════════════════════════════════
-  //  ✏️  CUSTOMIZATION
-  // ════════════════════════════════════════════════════════════════════════════
 
   const DASHBOARD_NAME = 'G-Dash';
 
@@ -31,9 +28,6 @@
 
   const ACCENT_COLOR = '#00c8ff';
 
-  // ════════════════════════════════════════════════════════════════════════════
-  //  🔥  FIREBASE + APEX (Discord OAuth) — fill in before use
-  // ════════════════════════════════════════════════════════════════════════════
   const FIREBASE_CONFIG = {
     apiKey:            "AIzaSyAQW_h_WLvRJE96j4E827ISKedMfYCFpA4",
     authDomain:        "apex-airways-5a1a7.firebaseapp.com",
@@ -46,7 +40,7 @@
   const APEX_CONFIG = {
     discordClientId:      "1508516763300659420",
     // Must match Discord Developer Portal → OAuth2 → Redirects (host public/oauth/callback.html)
-    discordRedirectUri:   "https://g-dash.pages.dev/",
+    discordRedirectUri:   "https://g-dash.pages.dev",
     sessionHeartbeatMs:   60_000,
     phaseDebounceMs:      3_000,
   };
@@ -88,6 +82,15 @@
   let allFlights = [], lastPosition = null;
   let totalDistNm = 0, maxAlt = 0, maxSpd = 0;
   let currentHeading = 0;
+  let autoFlightEnabled = true;
+  let groundPhaseCount = 0;
+  let airbornePhaseCount = 0;
+  let minTakeoffAlt = 500;
+  let minLandingAltStop = 100;
+  let autoStartThreshold = 5;
+  let autoStopThreshold = 15;
+  let flightStatus = 'idle';
+  let isLoggingOut = false;
 
   /** @type {{ discordId: string, profile: object|null, username: string }|null} */
   let authUser = null;
@@ -344,11 +347,15 @@
   async function setPilotOffline(discordId) {
     if (!db || !discordId) return;
     try {
+      console.log('[Apex] Setting pilot offline:', discordId);
       await db.collection(COLLECTIONS.PILOTS).doc(discordId).update({
         online: false,
         lastSeenAt: firebase.firestore.FieldValue.serverTimestamp(),
       });
-    } catch (_) {}
+      console.log('[Apex] Pilot offline status set successfully');
+    } catch (e) {
+      console.error('[Apex] Failed to set pilot offline:', e);
+    }
   }
 
   async function getPilotProfile(discordId) {
@@ -497,14 +504,31 @@
     lastPersistedPhase = null;
     displayFlightPhase('ground');
 
+    // Set pilot online status when session starts
+    try {
+      await db.collection(COLLECTIONS.PILOTS).doc(discordId).update({
+        online: true,
+        lastSeenAt: firebase.firestore.FieldValue.serverTimestamp(),
+      });
+    } catch (e) {
+      console.warn('[Apex] Failed to set pilot online status', e);
+    }
+
     if (apexHeartbeatTimer) clearInterval(apexHeartbeatTimer);
     apexHeartbeatTimer = setInterval(async () => {
-      if (!apexSessionId || !db) return;
+      if (!apexSessionId || !db || isLoggingOut) return;
       try {
+        // Update both session and pilot online status in heartbeat
         await db.collection(COLLECTIONS.SESSIONS).doc(apexSessionId).update({
           lastSeenAt: firebase.firestore.FieldValue.serverTimestamp(),
         });
-      } catch (_) {}
+        await db.collection(COLLECTIONS.PILOTS).doc(discordId).update({
+          online: true,
+          lastSeenAt: firebase.firestore.FieldValue.serverTimestamp(),
+        });
+      } catch (e) {
+        console.warn('[Apex] Heartbeat update failed', e);
+      }
     }, APEX_CONFIG.sessionHeartbeatMs);
 
     watchApexSession(apexSessionId);
@@ -576,6 +600,16 @@
       }
     }
 
+    // Set pilot online status when restoring user
+    try {
+      await db.collection(COLLECTIONS.PILOTS).doc(discordId).update({
+        online: true,
+        lastSeenAt: firebase.firestore.FieldValue.serverTimestamp(),
+      });
+    } catch (e) {
+      console.warn('[Apex] Failed to set pilot online status on restore', e);
+    }
+
     authUser = {
       discordId,
       username: profile.username || profile.globalName || 'Pilot',
@@ -621,8 +655,14 @@
   }
 
   async function logoutApex() {
+    isLoggingOut = true;
     if (flightActive) await stopFlight();
     await endApexSession();
+    // Clear heartbeat timer explicitly to prevent it from overriding offline status
+    if (apexHeartbeatTimer) {
+      clearInterval(apexHeartbeatTimer);
+      apexHeartbeatTimer = null;
+    }
     const id = getDiscordId();
     await setPilotOffline(id);
     if (apexPilotUnsub) { apexPilotUnsub(); apexPilotUnsub = null; }
@@ -634,6 +674,7 @@
     renderLogbook();
     renderAllTime();
     updateAuthUI();
+    isLoggingOut = false;
   }
 
   async function initApexAuth() {
@@ -723,6 +764,34 @@
   }
   function setText(id, val) {
     try { const el = document.getElementById(id); if (el) el.textContent = val; } catch {}
+  }
+
+  function updateAutoFlightStatus() {
+    const statusEl = document.getElementById('auto-flight-status');
+    if (!statusEl) return;
+
+    let statusText = 'Automatic Flight Tracking Enabled';
+    let statusColor = '#6da8c4';
+
+    if (flightStatus === 'starting') {
+      statusText = '⚡ Starting Flight...';
+      statusColor = '#ffb800';
+    } else if (flightStatus === 'stopping') {
+      statusText = '⚡ Saving Flight...';
+      statusColor = '#ffb800';
+    } else if (flightActive) {
+      statusText = '✈ Flight In Progress';
+      statusColor = '#00ff88';
+    } else if (airbornePhaseCount > 0) {
+      statusText = `⏳ Preparing... (${airbornePhaseCount}/${autoStartThreshold})`;
+      statusColor = '#ffb800';
+    } else if (groundPhaseCount > 0 && flightActive) {
+      statusText = `⏳ Landing... (${groundPhaseCount}/${autoStopThreshold})`;
+      statusColor = '#ffb800';
+    }
+
+    statusEl.textContent = statusText;
+    statusEl.style.color = statusColor;
   }
 
   // ════════════════════════════════════════════════════════════════════════════
@@ -1398,27 +1467,9 @@
               <div class="sec">◈ Current Session</div>
               <div id="gfs-session">
                 <div id="gfs-timer">00:00:00</div>
-                <button class="gfs-btn btn-start" id="gfs-start">Depart</button>
-                <button class="gfs-btn btn-land"  id="gfs-land" disabled>Land</button>
-              </div>
-
-              <div class="sec">◈ This Flight</div>
-              <div class="s-grid">
-                <div class="s-card">
-                  <div class="s-lbl">Distance</div>
-                  <div class="s-val" id="sf-dist">0.0</div>
-                  <div class="s-unit">Nautical Miles</div>
-                </div>
-                <div class="s-card">
-                  <div class="s-lbl">Max Altitude</div>
-                  <div class="s-val" id="sf-alt">0</div>
-                  <div class="s-unit">Feet</div>
-                </div>
-                <div class="s-card">
-                  <div class="s-lbl">Max Speed</div>
-                  <div class="s-val" id="sf-spd">0</div>
-                  <div class="s-unit">Knots</div>
-                </div>
+                <button class="gfs-btn btn-start" id="gfs-start" style="display:none">Depart</button>
+                <button class="gfs-btn btn-land"  id="gfs-land" style="display:none" disabled>Land</button>
+                <div id="auto-flight-status" style="font-size:11px;color:#6da8c4;letter-spacing:1px;margin-top:8px;">Automatic Flight Tracking Enabled</div>
               </div>
 
               <div class="sec">◈ All-Time Totals</div>
@@ -1634,6 +1685,42 @@
       displayFlightPhase(phase);
       if (apexSessionId) persistFlightPhaseDb(phase);
 
+      // Automatic flight start/stop detection
+      if (autoFlightEnabled && isLoggedIn()) {
+        const airbornePhases = ['takeoff', 'climb', 'cruise', 'descent', 'approach', 'landing'];
+        const isAirborne = airbornePhases.includes(phase);
+        const isGround = phase === 'ground' || phase === 'taxi';
+
+        if (isAirborne) {
+          groundPhaseCount = 0;
+          airbornePhaseCount++;
+          // Auto-start flight after threshold consecutive airborne readings
+          if (!flightActive && airbornePhaseCount >= autoStartThreshold && d.altFt >= minTakeoffAlt) {
+            console.log('[Auto-Flight] Starting flight - detected takeoff at', d.altFt, 'ft');
+            flightStatus = 'starting';
+            startFlight().catch(e => {
+              console.warn('[Auto-Flight] Start failed:', e);
+              flightStatus = 'idle';
+            });
+          }
+        } else if (isGround) {
+          airbornePhaseCount = 0;
+          groundPhaseCount++;
+          // Auto-stop flight after threshold consecutive ground readings and low altitude
+          if (flightActive && groundPhaseCount >= autoStopThreshold && d.altFt <= minLandingAltStop) {
+            console.log('[Auto-Flight] Stopping flight - detected landing at', d.altFt, 'ft');
+            flightStatus = 'stopping';
+            stopFlight().catch(e => {
+              console.warn('[Auto-Flight] Stop failed:', e);
+              flightStatus = 'active';
+            });
+          }
+        }
+
+        // Update flight status display
+        updateAutoFlightStatus();
+      }
+
       if (flightActive) {
         if (flightPathCoords.length > 0) {
           const [pLat, pLon] = flightPathCoords[flightPathCoords.length - 1];
@@ -1643,10 +1730,6 @@
         flightPath?.setLatLngs(flightPathCoords);
         if (d.altFt    > maxAlt) maxAlt = d.altFt;
         if (d.speedKts > maxSpd) maxSpd = d.speedKts;
-
-        setText('sf-dist', totalDistNm.toFixed(1));
-        setText('sf-alt',  maxAlt.toLocaleString());
-        setText('sf-spd',  maxSpd.toFixed(0));
 
         const pilotId = getDiscordId();
         if (currentFlightId && db && pilotId && flightPathCoords.length % 30 === 0) {
@@ -1747,8 +1830,8 @@
     totalFlightSecs = 0; totalDistNm = 0; maxAlt = 0; maxSpd = 0;
     flightPathCoords = []; flightPath?.setLatLngs([]);
     lastPlaneSample = null;
-
-    setText('sf-dist','0.0'); setText('sf-alt','0'); setText('sf-spd','0');
+    groundPhaseCount = 0;
+    airbornePhaseCount = 0;
 
     document.getElementById('gfs-start').disabled = true;
     document.getElementById('gfs-land').disabled  = false;
@@ -1761,6 +1844,8 @@
 
     try {
       await startApexSession();
+      flightStatus = 'active';
+      updateAutoFlightStatus();
     } catch (e) {
       console.warn('[Apex] session start failed', e);
     }
@@ -1794,6 +1879,8 @@
     document.getElementById('gfs-timer').classList.remove('live');
     setText('gfs-timer','00:00:00');
     totalFlightSecs = 0;
+    groundPhaseCount = 0;
+    airbornePhaseCount = 0;
 
     await endApexSession();
 
@@ -1812,6 +1899,8 @@
       currentFlightId = null;
     }
     await loadFlights();
+    flightStatus = 'idle';
+    updateAutoFlightStatus();
   }
 
   // ════════════════════════════════════════════════════════════════════════════
@@ -2150,13 +2239,31 @@
     startClock();
     updateSettingsUI();
 
-    document.addEventListener('visibilitychange', () => {
+    document.addEventListener('visibilitychange', async () => {
       if (document.visibilityState === 'hidden' && apexSessionId && !flightActive) {
-        endApexSession().catch(() => {});
+        isLoggingOut = true;
+        await endApexSession().catch(() => {});
+        const discordId = getDiscordId();
+        if (discordId) await setPilotOffline(discordId);
+        isLoggingOut = false;
+      } else if (document.visibilityState === 'visible' && isLoggedIn() && !apexSessionId) {
+        // Restore pilot online status when tab becomes visible
+        const discordId = getDiscordId();
+        if (discordId && db) {
+          db.collection(COLLECTIONS.PILOTS).doc(discordId).update({
+            online: true,
+            lastSeenAt: firebase.firestore.FieldValue.serverTimestamp(),
+          }).catch(() => {});
+        }
       }
     });
-    window.addEventListener('pagehide', () => {
-      if (apexSessionId && !flightActive) endApexSession().catch(() => {});
+    window.addEventListener('pagehide', async () => {
+      isLoggingOut = true;
+      if (apexSessionId && !flightActive) {
+        await endApexSession().catch(() => {});
+      }
+      const discordId = getDiscordId();
+      if (discordId) await setPilotOffline(discordId);
     });
 
     const pilot = getDiscordId();
