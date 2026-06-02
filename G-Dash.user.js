@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         G-DASH
+// @name         G-DASH 
 // @namespace    https://github.com/hect0o
-// @version      2.1.0
+// @version      2.2.0
 // @description  G-Dash dashboard for GeoFS — Discord login, live map, sessions, flight logbook
 // @author       hecto.oooo
 // @match        https://www.geo-fs.com/geofs.php*
@@ -16,6 +16,9 @@
 (function () {
   'use strict';
 
+  // ════════════════════════════════════════════════════════════════════════════
+  //  ✏️  CUSTOMIZATION
+  // ════════════════════════════════════════════════════════════════════════════
 
   const DASHBOARD_NAME = 'G-Dash';
 
@@ -28,6 +31,9 @@
 
   const ACCENT_COLOR = '#00c8ff';
 
+  // ════════════════════════════════════════════════════════════════════════════
+  //  🔥  FIREBASE + APEX (Discord OAuth) — fill in before use
+  // ════════════════════════════════════════════════════════════════════════════
   const FIREBASE_CONFIG = {
     apiKey:            "AIzaSyAQW_h_WLvRJE96j4E827ISKedMfYCFpA4",
     authDomain:        "apex-airways-5a1a7.firebaseapp.com",
@@ -142,7 +148,7 @@
   }
 
   // ════════════════════════════════════════════════════════════════════════════
-  //  APEX AIRWAYS — AUTH + SESSION
+  //  G-Dash — AUTH + SESSION
   // ════════════════════════════════════════════════════════════════════════════
   function assertApexConfig() {
     const missing = [];
@@ -1469,6 +1475,7 @@
                 <div id="gfs-timer">00:00:00</div>
                 <button class="gfs-btn btn-start" id="gfs-start" style="display:none">Depart</button>
                 <button class="gfs-btn btn-land"  id="gfs-land" style="display:none" disabled>Land</button>
+                <button class="gfs-btn" id="gfs-save-clear" style="background:linear-gradient(135deg,#f39c12,#f1c40f);color:#04110a;box-shadow:0 0 14px #f1c40f44;margin-top:8px;">Save & Clear</button>
                 <div id="auto-flight-status" style="font-size:11px;color:#6da8c4;letter-spacing:1px;margin-top:8px;">Automatic Flight Tracking Enabled</div>
               </div>
 
@@ -1525,7 +1532,7 @@
               <div class="sec">◈ Account</div>
               <div class="setting-row">
                 <div class="setting-label">Discord Authentication</div>
-                <div class="setting-desc">Login links your GeoFS logbook to your Discord account via Apex Airways. Logout ends your active session.</div>
+                <div class="setting-desc">Login links your GeoFS logbook to your Discord account via G-Dash. Logout ends your active session.</div>
                 <div style="display:flex;gap:10px;margin-top:8px;">
                   <button class="gfs-btn btn-start" id="gfs-settings-login" type="button" style="flex:1">Login</button>
                   <button class="gfs-btn btn-land" id="gfs-settings-logout" type="button" style="flex:1">Logout</button>
@@ -1903,6 +1910,65 @@
     updateAutoFlightStatus();
   }
 
+  async function saveAndClearFlight() {
+    if (!flightActive) {
+      alert('No active flight to save.');
+      return;
+    }
+
+    const savedDuration = totalFlightSecs;
+    const savedDistNm = totalDistNm;
+    const savedMaxAlt = maxAlt;
+    const savedMaxSpd = maxSpd;
+
+    const pilotId = getDiscordId();
+    if (!db || !pilotId) {
+      alert('Login required to save flight.');
+      return;
+    }
+
+    try {
+      // Save current flight data to Firebase
+      const pos = getPlaneData();
+      const ref = await db.collection('pilots').doc(pilotId)
+        .collection('flights').add({
+          startTime: firebase.firestore.FieldValue.serverTimestamp(),
+          startLat: flightPathCoords.length > 0 ? flightPathCoords[0][0] : pos?.lat ?? null,
+          startLon: flightPathCoords.length > 0 ? flightPathCoords[0][1] : pos?.lon ?? null,
+          durationSeconds: savedDuration,
+          distanceNm: parseFloat(savedDistNm.toFixed(2)),
+          maxAltitude: savedMaxAlt,
+          maxSpeed: savedMaxSpd,
+          endTime: firebase.firestore.FieldValue.serverTimestamp(),
+          status: 'completed',
+          pilotId,
+          manualSave: true
+        });
+
+      console.log('[G-Dash] Manual save successful:', ref.id);
+
+      // Reset current flight data but keep automatic system running
+      totalFlightSecs = 0;
+      totalDistNm = 0;
+      maxAlt = 0;
+      maxSpd = 0;
+      flightPathCoords = [];
+      flightPath?.setLatLngs([]);
+      flightStartTime = Date.now();
+
+      // Update the current flight ID to the new saved flight
+      currentFlightId = ref.id;
+
+      // Reload flights to show the new entry
+      await loadFlights();
+
+      alert('Flight saved successfully! Automatic tracking continues.');
+    } catch (e) {
+      console.error('[G-Dash] Manual save error:', e);
+      alert('Failed to save flight: ' + (e.message || 'Unknown error'));
+    }
+  }
+
   // ════════════════════════════════════════════════════════════════════════════
   //  SETTINGS UI
   // ════════════════════════════════════════════════════════════════════════════
@@ -2217,6 +2283,7 @@
 
     document.getElementById('gfs-start').addEventListener('click', () => startFlight().catch(console.warn));
     document.getElementById('gfs-land').addEventListener('click', () => stopFlight().catch(console.warn));
+    document.getElementById('gfs-save-clear').addEventListener('click', () => saveAndClearFlight().catch(console.warn));
 
     document.getElementById('confirm-yes-btn').addEventListener('click', confirmDelete);
     document.getElementById('confirm-no-btn').addEventListener('click',  hideDeleteConfirm);
@@ -2267,7 +2334,7 @@
     });
 
     const pilot = getDiscordId();
-    console.log(`[Apex Airways] Ready  |  ${pilot ? 'Pilot ' + pilot : 'Guest — login required'}  |  Key: ${formatKey(settings.keybind)}`);
+    console.log(`[G-Dash] Ready  |  ${pilot ? 'Pilot ' + pilot : 'Guest — login required'}  |  Key: ${formatKey(settings.keybind)}`);
   }
 
   const waitReady = setInterval(() => {
