@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         G-DASH 
+// @name         G-DASH
 // @namespace    https://github.com/hect0o
-// @version      2.2.0
+// @version      2.3.0
 // @description  G-Dash dashboard for GeoFS — Discord login, live map, sessions, flight logbook
 // @author       hecto.oooo
 // @match        https://www.geo-fs.com/geofs.php*
@@ -31,9 +31,7 @@
 
   const ACCENT_COLOR = '#00c8ff';
 
-  // ════════════════════════════════════════════════════════════════════════════
-  //  🔥  FIREBASE + APEX (Discord OAuth) — fill in before use
-  // ════════════════════════════════════════════════════════════════════════════
+
   const FIREBASE_CONFIG = {
     apiKey:            "AIzaSyAQW_h_WLvRJE96j4E827ISKedMfYCFpA4",
     authDomain:        "apex-airways-5a1a7.firebaseapp.com",
@@ -77,6 +75,7 @@
   if (!settings.quarterScreen) settings.quarterScreen = false;
   if (settings.compactX === undefined) settings.compactX = null;
   if (settings.compactY === undefined) settings.compactY = null;
+  if (!settings.flightPlanColor) settings.flightPlanColor = '#ff6b6b';
 
   // ════════════════════════════════════════════════════════════════════════════
   //  STATE
@@ -97,6 +96,8 @@
   let autoStopThreshold = 15;
   let flightStatus = 'idle';
   let isLoggingOut = false;
+  let autoCenterEnabled = true;
+  let flightPlanPolyline = null;
 
   /** @type {{ discordId: string, profile: object|null, username: string }|null} */
   let authUser = null;
@@ -1569,6 +1570,16 @@
                 </div>
               </div>
 
+              <div class="sec">◈ Map Display</div>
+              <div class="setting-row">
+                <div class="setting-label">Flight Plan Color</div>
+                <div class="setting-desc">Choose the color for the flight plan route displayed on the live map.</div>
+                <div style="display:flex;align-items:center;gap:14px;margin-top:4px;">
+                  <input type="color" id="flight-plan-color-picker" value="${settings.flightPlanColor}" style="width:50px;height:30px;border:none;cursor:pointer;background:none;">
+                  <span id="flight-plan-color-label" style="font-family:'Orbitron',monospace;font-size:11px;color:#fff;">${settings.flightPlanColor}</span>
+                </div>
+              </div>
+
             </div>
           </div>
 
@@ -1651,8 +1662,24 @@
       color:A, weight:2.5, opacity:.5, dashArray:'7,5'
     }).addTo(map);
 
+    flightPlanPolyline = L.polyline([], {
+      color:settings.flightPlanColor, weight:3, opacity:.9, dashArray:'10,5'
+    }).addTo(map);
+    flightPlanPolyline.bringToFront();
+
     document.getElementById('gfs-center').addEventListener('click', () => {
-      if (lastPosition) map.setView([lastPosition.lat, lastPosition.lon], Math.max(map.getZoom(), 8));
+      autoCenterEnabled = !autoCenterEnabled;
+      const btn = document.getElementById('gfs-center');
+      if (autoCenterEnabled) {
+        btn.style.background = 'rgba(4,9,18,.94)';
+        btn.style.borderColor = '#1e3d58';
+        btn.title = 'Auto-center: ON (click to toggle)';
+        if (lastPosition) map.setView([lastPosition.lat, lastPosition.lon], Math.max(map.getZoom(), 8));
+      } else {
+        btn.style.background = 'rgba(255,107,107,.2)';
+        btn.style.borderColor = '#ff6b6b';
+        btn.title = 'Auto-center: OFF (click to toggle)';
+      }
     });
   }
 
@@ -1661,6 +1688,76 @@
     if (!el) return;
     const container = el.querySelector('#plane-container');
     if (container) container.style.transform = `rotate(${heading}deg)`;
+  }
+
+  function updateFlightPlan() {
+    if (!flightPlanPolyline || !map) return;
+    
+    try {
+      const geofsFlightPlan = window.geofs?.flightPlan;
+      console.log('[G-Dash] Flight plan object:', geofsFlightPlan);
+      
+      if (!geofsFlightPlan) {
+        flightPlanPolyline.setLatLngs([]);
+        return;
+      }
+
+      // Try calling export() method if available
+      let waypoints = null;
+      if (typeof geofsFlightPlan.export === 'function') {
+        try {
+          const exported = geofsFlightPlan.export();
+          console.log('[G-Dash] Exported flight plan:', exported);
+          waypoints = exported.waypoints || exported.points || exported.route || exported;
+        } catch (e) {
+          console.warn('[G-Dash] Export failed:', e);
+        }
+      }
+
+      // If export didn't work, try direct properties
+      if (!waypoints) {
+        console.log('[G-Dash] Flight plan keys:', Object.keys(geofsFlightPlan));
+        waypoints = geofsFlightPlan.waypoints || 
+                    geofsFlightPlan.points || 
+                    geofsFlightPlan.route ||
+                    geofsFlightPlan.flightPlan ||
+                    geofsFlightPlan.waypoint;
+      }
+      
+      console.log('[G-Dash] Waypoints:', waypoints);
+      
+      if (!waypoints) {
+        flightPlanPolyline.setLatLngs([]);
+        return;
+      }
+      
+      // Handle if waypoints is stored as JSON string
+      if (typeof waypoints === 'string') {
+        try {
+          waypoints = JSON.parse(waypoints);
+          console.log('[G-Dash] Parsed waypoints:', waypoints);
+        } catch (e) {
+          console.warn('[G-Dash] Failed to parse waypoints JSON:', e);
+          flightPlanPolyline.setLatLngs([]);
+          return;
+        }
+      }
+
+      const coords = waypoints
+        .filter(wp => wp.lat && wp.lon)
+        .map(wp => [wp.lat, wp.lon]);
+
+      console.log('[G-Dash] Flight plan coords:', coords);
+
+      if (coords.length > 1) {
+        flightPlanPolyline.setLatLngs(coords);
+        flightPlanPolyline.bringToFront();
+      } else {
+        flightPlanPolyline.setLatLngs([]);
+      }
+    } catch (e) {
+      console.warn('[G-Dash] Failed to read flight plan:', e);
+    }
   }
 
   // ════════════════════════════════════════════════════════════════════════════
@@ -1686,6 +1783,9 @@
 
       planeMarker?.setLatLng([d.lat, d.lon]);
       rotatePlane(d.heading);
+      if (autoCenterEnabled && map) map.setView([d.lat, d.lon], map.getZoom());
+
+      updateFlightPlan();
 
       const phase = inferFlightPhase(d, lastPlaneSample);
       lastPlaneSample = { altFt: d.altFt, speedKts: d.speedKts, lat: d.lat, lon: d.lon };
@@ -2125,6 +2225,21 @@
     toggle.addEventListener('click', () => applySize(!settings.quarterScreen));
     // Restore saved preference on load
     if (settings.quarterScreen) applySize(true);
+
+    // Flight plan color picker
+    const colorPicker = document.getElementById('flight-plan-color-picker');
+    const colorLabel = document.getElementById('flight-plan-color-label');
+    if (colorPicker) {
+      colorPicker.addEventListener('input', (e) => {
+        const newColor = e.target.value;
+        settings.flightPlanColor = newColor;
+        saveSettings(settings);
+        colorLabel.textContent = newColor;
+        if (flightPlanPolyline) {
+          flightPlanPolyline.setStyle({ color: newColor });
+        }
+      });
+    }
   }
 
   // ════════════════════════════════════════════════════════════════════════════
@@ -2345,3 +2460,4 @@
   }, 500);
 
 })();
+
